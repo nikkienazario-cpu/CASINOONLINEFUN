@@ -1,0 +1,118 @@
+// server.js - minimal Socket.IO game server
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const { v4: uuidv4 } = require('uuid');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+
+const PORT = process.env.PORT || 3000;
+
+// In-memory stores for demo. Replace with DB for production.
+const users = {};        // socketId -> {id, name}
+const rooms = {};        // roomId -> {players: [socketId], gameState: {...}}
+
+// Utility: create a new room
+function createRoom(hostSocketId, gameType='pinochle') {
+  const roomId = uuidv4();
+  rooms[roomId] = { id: roomId, gameType, players: [hostSocketId], gameState: null };
+  return rooms[roomId];
+}
+
+// Example: initialize a simple pinochle-like deal
+function initPinochleState() {
+  // simplified deck and deal for demo
+  const ranks = ['9','J','Q','K','10','A'];
+  const suits = ['♠','♥','♦','♣'];
+  let deck = [];
+  for (let d=0; d<2; d++) for (const r of ranks) for (const s of suits) deck.push({r,s});
+  // shuffle
+  for (let i = deck.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [deck[i], deck[j]] = [deck[j], deck[i]];
+  }
+  return { deck, hands: {} };
+}
+
+io.on('connection', socket => {
+  console.log('connect', socket.id);
+
+  socket.on('auth', ({name}) => {
+    users[socket.id] = { id: socket.id, name: name || 'Guest' };
+    socket.emit('auth_ok', { id: socket.id, name: users[socket.id].name });
+  });
+
+  socket.on('create_room', ({gameType}) => {
+    const room = createRoom(socket.id, gameType);
+    socket.join(room.id);
+    io.to(socket.id).emit('room_created', { roomId: room.id, gameType: room.gameType });
+  });
+
+  socket.on('join_room', ({roomId}) => {
+    const room = rooms[roomId];
+    if (!room) { socket.emit('error_msg', 'Room not found'); return; }
+    if (room.players.length >= 6) { socket.emit('error_msg', 'Room full'); return; }
+    room.players.push(socket.id);
+    socket.join(roomId);
+    io.in(roomId).emit('room_update', { roomId, players: room.players.map(id => users[id]?.name || id) });
+  });
+
+  socket.on('start_game', ({roomId}) => {
+    const room = rooms[roomId];
+    if (!room) return;
+    // Example for pinochle: create deck and deal 5 cards each
+    if (room.gameType === 'pinochle') {
+      const state = initPinochleState();
+      for (const pid of room.players) {
+        state.hands[pid] = [state.deck.pop(), state.deck.pop(), state.deck.pop(), state.deck.pop(), state.deck.pop()];
+      }
+      room.gameState = state;
+      // send each player their private hand and broadcast public state
+      for (const pid of room.players) {
+        io.to(pid).emit('deal_private', { hand: state.hands[pid] });
+      }
+      io.in(roomId).emit('game_started', { public: { players: room.players.map(id => users[id].name) } });
+    }
+  });
+
+  socket.on('play_action', ({roomId, action, payload}) => {
+    // Validate action server-side, update state, broadcast
+    const room = rooms[roomId];
+    if (!room) return;
+    // Example: player plays a card in pinochle
+    if (room.gameType === 'pinochle' && action === 'play_card') {
+      const playerHand = room.gameState.hands[socket.id];
+      const idx = playerHand.findIndex(c => c.r === payload.r && c.s === payload.s);
+      if (idx === -1) { socket.emit('error_msg', 'Invalid card'); return; }
+      const card = playerHand.splice(idx,1)[0];
+      room.gameState.lastTrick = room.gameState.lastTrick || [];
+      room.gameState.lastTrick.push({player: socket.id, card});
+      io.in(roomId).emit('trick_update', { trick: room.gameState.lastTrick.map(t => ({player: users[t.player].name, card: t.card})) });
+      // further logic: when trick complete, evaluate winner, etc.
+    }
+  });
+
+  socket.on('leave_room', ({roomId}) => {
+    const room = rooms[roomId];
+    if (!room) return;
+    room.players = room.players.filter(id => id !== socket.id);
+    socket.leave(roomId);
+    io.in(roomId).emit('room_update', { roomId, players: room.players.map(id => users[id]?.name || id) });
+  });
+
+  socket.on('disconnect', () => {
+    console.log('disconnect', socket.id);
+    // remove from rooms
+    for (const r of Object.values(rooms)) {
+      if (r.players.includes(socket.id)) {
+        r.players = r.players.filter(id => id !== socket.id);
+        io.in(r.id).emit('room_update', { roomId: r.id, players: r.players.map(id => users[id]?.name || id) });
+      }
+    }
+    delete users[socket.id];
+  });
+});
+
+server.listen(PORT, ()=> console.log('Server listening on', PORT));
